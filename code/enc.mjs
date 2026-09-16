@@ -4,49 +4,24 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const KEY_ENV_NAME = 'FILE_ENCRYPTION_KEY'
+const VERSION = 2
 
-export async function encryptFile(inputPath, outputPath, rounds, keyText) {
-  if (!Number.isSafeInteger(rounds) || rounds < 1) {
-    throw new Error('rounds must be a positive integer')
-  }
-
-  if (!keyText) {
-    throw new Error(`${KEY_ENV_NAME} must not be empty`)
-  }
-
+export async function encryptFile(inputPath, outputPath, keyText, textMode = false) {
+  if (!keyText) throw new Error(`${KEY_ENV_NAME} must not be empty`)
   if (resolve(inputPath) === resolve(outputPath)) {
     throw new Error('output path must be different from input path')
   }
 
   const salt = randomBytes(16)
+  const iv = randomBytes(12)
+  const header = Buffer.concat([Buffer.from([VERSION]), salt, iv])
   const key = scryptSync(keyText, salt, 32)
-  const base64 = (await readFile(inputPath)).toString('base64')
-  let payload = Buffer.from(base64, 'utf8')
-  const layers = []
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(header)
+  const ciphertext = Buffer.concat([cipher.update(await readFile(inputPath)), cipher.final()])
 
-  for (let round = 0; round < rounds; round++) {
-    const iv = randomBytes(12)
-    const cipher = createCipheriv('aes-256-gcm', key, iv)
-    payload = Buffer.concat([cipher.update(payload), cipher.final()])
-    layers.push({
-      iv: iv.toString('base64'),
-      authTag: cipher.getAuthTag().toString('base64'),
-    })
-  }
-
-  const envelope = {
-    version: 1,
-    algorithm: 'aes-256-gcm',
-    keyDerivation: 'scrypt',
-    salt: salt.toString('base64'),
-    encoding: 'base64',
-    rounds,
-    layers,
-    ciphertext: payload.toString('base64'),
-  }
-
-  await writeFile(outputPath, `${JSON.stringify(envelope, null, 2)}\n`, {
-    encoding: 'utf8',
+  const encrypted = Buffer.concat([header, ciphertext, cipher.getAuthTag()])
+  await writeFile(outputPath, textMode ? `${encrypted.toString('base64')}\n` : encrypted, {
     flag: 'wx',
   })
 }
@@ -56,18 +31,17 @@ export async function main(
   keyText = process.env[KEY_ENV_NAME] ?? '',
   log = console.log,
 ) {
-  const [inputPath, roundsText, requestedOutputPath] = args
-
-  if (!inputPath || !roundsText) {
+  const textMode = args.includes('--text')
+  const [inputPath, requestedOutputPath] = args.filter(arg => arg !== '--text')
+  if (!inputPath) {
     throw new Error(
-      `usage: ${KEY_ENV_NAME}=<any non-empty string> node scripts/encrypt-file.mjs <input> <rounds> [output]`,
+      `usage: ${KEY_ENV_NAME}=<your key string> node scripts/encrypt-file.mjs [--text] <input> [output]`,
     )
   }
 
-  const outputPath = requestedOutputPath ?? `${inputPath}.encrypted.json`
-  const rounds = Number(roundsText)
-  await encryptFile(inputPath, outputPath, rounds, keyText)
-  log(`Encrypted ${inputPath} ${rounds} time(s) -> ${outputPath}`)
+  const outputPath = requestedOutputPath ?? `${inputPath}.encrypted${textMode ? '.txt' : ''}`
+  await encryptFile(inputPath, outputPath, keyText, textMode)
+  log(`Encrypted ${inputPath} -> ${outputPath}`)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
