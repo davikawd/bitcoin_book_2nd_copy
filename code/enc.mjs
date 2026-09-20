@@ -2,9 +2,10 @@ import { createCipheriv, randomBytes, scryptSync } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { gzipSync } from 'node:zlib'
 
 const KEY_ENV_NAME = 'FILE_ENCRYPTION_KEY'
-const VERSION = 2
+const VERSION = 4
 
 export async function encryptFile(inputPath, outputPath, keyText, textMode = false) {
   if (!keyText) throw new Error(`${KEY_ENV_NAME} must not be empty`)
@@ -21,9 +22,18 @@ export async function encryptFile(inputPath, outputPath, keyText, textMode = fal
   const ciphertext = Buffer.concat([cipher.update(await readFile(inputPath)), cipher.final()])
 
   const encrypted = Buffer.concat([header, ciphertext, cipher.getAuthTag()])
-  await writeFile(outputPath, textMode ? `${encrypted.toString('base64')}\n` : encrypted, {
-    flag: 'wx',
-  })
+  const encryptRepresentation = textMode
+    ? Buffer.from(encrypted.toString('base64'), 'ascii')
+    : encrypted
+  const compressed = gzipSync(
+    Buffer.concat([Buffer.from([textMode ? 1 : 0]), encryptRepresentation]),
+    { level: 9 },
+  )
+  await writeFile(
+    outputPath,
+    textMode ? `${compressed.toString('base64')}\n` : compressed,
+    { flag: 'wx' },
+  )
 }
 
 export async function main(
@@ -39,7 +49,8 @@ export async function main(
     )
   }
 
-  const outputPath = requestedOutputPath ?? `${inputPath}.encrypted${textMode ? '.txt' : ''}`
+  const outputPath = requestedOutputPath
+    ?? `${inputPath}.encrypted${textMode ? '.txt' : ''}`
   await encryptFile(inputPath, outputPath, keyText, textMode)
   log(`Encrypted ${inputPath} -> ${outputPath}`)
 }
