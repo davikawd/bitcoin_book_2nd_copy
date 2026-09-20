@@ -2,9 +2,11 @@ import { createDecipheriv, scryptSync } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { gunzipSync } from 'node:zlib'
 
 const KEY_ENV_NAME = 'FILE_ENCRYPTION_KEY'
-const VERSION = 2
+const VERSION = 4
+const PREVIOUS_VERSION = 2
 const HEADER_SIZE = 29
 const AUTH_TAG_SIZE = 16
 
@@ -17,7 +19,11 @@ function decodeTextContainer(encrypted) {
 }
 
 function decryptCurrent(encrypted, keyText) {
-  if (encrypted.length < HEADER_SIZE + AUTH_TAG_SIZE || encrypted[0] !== VERSION) {
+  const version = encrypted[0]
+  if (
+    encrypted.length < HEADER_SIZE + AUTH_TAG_SIZE
+    || (version !== VERSION && version !== PREVIOUS_VERSION)
+  ) {
     throw new Error('invalid or unsupported encrypted file')
   }
 
@@ -72,19 +78,48 @@ export async function decryptFile(inputPath, outputPath, keyText) {
   const encrypted = await readFile(inputPath)
   let content
   try {
-    content = encrypted[0] === 0x7b
-      ? decryptLegacy(encrypted, keyText)
-      : decryptCurrent(encrypted[0] === VERSION ? encrypted : decodeTextContainer(encrypted), keyText)
+    if (encrypted[0] === 0x7b) {
+      content = decryptLegacy(encrypted, keyText)
+    }
+    else {
+      let container = encrypted
+      const recognized = container[0] === 0x1f && container[1] === 0x8b
+        || container[0] === VERSION
+        || container[0] === PREVIOUS_VERSION
+      if (!recognized) container = decodeTextContainer(container)
+
+      if (container[0] === 0x1f && container[1] === 0x8b) {
+        const decompressed = gunzipSync(container, {
+          maxOutputLength: Math.max(1024 * 1024, container.length * 16),
+        })
+        const mode = decompressed[0]
+        if (mode !== 0 && mode !== 1) {
+          throw new Error('invalid or unsupported encrypted file')
+        }
+        container = mode === 1
+          ? decodeTextContainer(decompressed.subarray(1))
+          : decompressed.subarray(1)
+      }
+      content = decryptCurrent(container, keyText)
+    }
   }
   catch (error) {
-    if (error instanceof Error && /invalid|unsupported/.test(error.message)) throw error
+    if (error instanceof Error && error.message === 'invalid or unsupported encrypted file') {
+      throw error
+    }
     throw new Error('decryption failed: wrong key or damaged file')
   }
   await writeFile(outputPath, content, { flag: 'wx' })
 }
 
 function defaultOutputPath(inputPath) {
-  for (const suffix of ['.encrypted.json', '.encrypted.txt', '.encrypted']) {
+  for (const suffix of [
+    '.encrypted.txt',
+    '.encrypted',
+    '.encrypted-text.gz',
+    '.encrypted.gz',
+    '.encrypted.json',
+  ]) {
     if (inputPath.endsWith(suffix)) {
       return `${inputPath.slice(0, -suffix.length)}.decrypted`
     }
